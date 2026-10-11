@@ -332,6 +332,8 @@ export const authorize = (input: {
   readonly config: typeof ConfigMCP.Remote.Type
   readonly integrationID: Integration.ID
   readonly methodID: Integration.MethodID
+  /** Paste-the-callback flow for hosts the browser cannot call back to; skips the loopback listener. */
+  readonly manual?: boolean
 }) =>
   Effect.gen(function* () {
     const fields = { server: input.name, methodID: input.methodID, oauthAttemptID: crypto.randomUUID() }
@@ -349,52 +351,63 @@ export const authorize = (input: {
       const client = clientFromCredential(previous)
       if (client) yield* Effect.promise(() => store.saveClientInformation(client))
     }
-    const code = yield* Deferred.make<{ code: string; iss: string | undefined; response: ServerResponse }, Error>()
     const redirect = oauth?.redirect_uri ? new URL(oauth.redirect_uri) : undefined
     const redirectPath = redirect?.pathname ?? "/callback"
     const state = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url")
 
-    // Lazy so runtimes without a loopback listener (workerd) never evaluate node:http.
-    const { createServer } = yield* Effect.promise(() => import("node:http"))
-    const server = createServer((request, response) => {
-      const url = new URL(request.url ?? "/", "http://127.0.0.1")
-      if (url.pathname !== redirectPath) {
-        response.writeHead(404).end("Not found")
-        return
-      }
-      const fail = (reason: string, failure: string) => {
-        runFork(Effect.logWarning("mcp oauth callback rejected", { ...fields, reason: failure }))
-        Effect.runSync(Deferred.fail(code, new Error(reason)))
-        response
-          .writeHead(400, { "Content-Type": "text/html" })
-          .end(OauthCallbackPage.error(reason, { provider: input.name }))
-      }
-      const error = url.searchParams.get("error_description") ?? url.searchParams.get("error")
-      if (error) return fail(error, "authorization_error")
-      if (url.searchParams.get("state") !== state) return fail("OAuth state mismatch", "state_mismatch")
-      const value = url.searchParams.get("code")
-      if (!value) return fail("Missing authorization code", "missing_code")
-      // The page waits for the token exchange so the browser never reports success for a rejected code.
-      if (
-        !Effect.runSync(Deferred.succeed(code, { code: value, iss: url.searchParams.get("iss") ?? undefined, response }))
-      )
-        response.writeHead(409).end("OAuth callback already received")
-    })
+    // Manual mode serves hosts the browser cannot call back to, so it binds no listener.
+    const loopback = input.manual
+      ? undefined
+      : yield* Effect.gen(function* () {
+          const code = yield* Deferred.make<
+            { code: string; iss: string | undefined; response: ServerResponse },
+            Error
+          >()
+          // Lazy so runtimes without a loopback listener (workerd) never evaluate node:http.
+          const { createServer } = yield* Effect.promise(() => import("node:http"))
+          const server = createServer((request, response) => {
+            const url = new URL(request.url ?? "/", "http://127.0.0.1")
+            if (url.pathname !== redirectPath) {
+              response.writeHead(404).end("Not found")
+              return
+            }
+            const fail = (reason: string, failure: string) => {
+              runFork(Effect.logWarning("mcp oauth callback rejected", { ...fields, reason: failure }))
+              Effect.runSync(Deferred.fail(code, new Error(reason)))
+              response
+                .writeHead(400, { "Content-Type": "text/html" })
+                .end(OauthCallbackPage.error(reason, { provider: input.name }))
+            }
+            const error = url.searchParams.get("error_description") ?? url.searchParams.get("error")
+            if (error) return fail(error, "authorization_error")
+            if (url.searchParams.get("state") !== state) return fail("OAuth state mismatch", "state_mismatch")
+            const value = url.searchParams.get("code")
+            if (!value) return fail("Missing authorization code", "missing_code")
+            // The page waits for the token exchange so the browser never reports success for a rejected code.
+            if (
+              !Effect.runSync(
+                Deferred.succeed(code, { code: value, iss: url.searchParams.get("iss") ?? undefined, response }),
+              )
+            )
+              response.writeHead(409).end("OAuth callback already received")
+          })
 
-    // callback_port, else the port pinned by redirect_uri, else ephemeral; a mismatch strands the browser.
-    const redirectPort = Number(redirect?.port) || undefined
-    const port = yield* Effect.callback<number, Error>((resume) => {
-      server.once("error", (error) => resume(Effect.fail(error)))
-      server.listen(oauth?.callback_port ?? redirectPort ?? 0, "127.0.0.1", () => {
-        const address = server.address()
-        resume(
-          address && typeof address === "object"
-            ? Effect.succeed(address.port)
-            : Effect.fail(new Error("Could not determine MCP OAuth callback port")),
-        )
-      })
-    })
-    yield* Effect.addFinalizer(() => Effect.sync(() => server.close()))
+          // callback_port, else the port pinned by redirect_uri, else ephemeral; a mismatch strands the browser.
+          const redirectPort = Number(redirect?.port) || undefined
+          const port = yield* Effect.callback<number, Error>((resume) => {
+            server.once("error", (error) => resume(Effect.fail(error)))
+            server.listen(oauth?.callback_port ?? redirectPort ?? 0, "127.0.0.1", () => {
+              const address = server.address()
+              resume(
+                address && typeof address === "object"
+                  ? Effect.succeed(address.port)
+                  : Effect.fail(new Error("Could not determine MCP OAuth callback port")),
+              )
+            })
+          })
+          yield* Effect.addFinalizer(() => Effect.sync(() => server.close()))
+          return { code, port }
+        })
 
     // The server's 401 names where its resource metadata lives and which scopes it wants; without it
     // discovery can only guess the well-known path, which not every server layout answers.
@@ -445,7 +458,7 @@ export const authorize = (input: {
       clientMetadataUrl: cimd ? CLIENT_METADATA_URL : undefined,
       discovery: { ...discovery, resourceMetadataUrl: resourceMetadataUrl?.toString() },
       redirect: {
-        url: oauth?.redirect_uri ?? `http://127.0.0.1:${port}${redirectPath}`,
+        url: oauth?.redirect_uri ?? `http://127.0.0.1${loopback ? `:${loopback.port}` : ""}${redirectPath}`,
         state,
         open: (url) => {
           authorizationUrl = url
@@ -466,6 +479,19 @@ export const authorize = (input: {
       return toCredential({ methodID: input.methodID, serverUrl: input.config.url, tokens, client })
     })
 
+    const exchange = (authorizationCode: string, iss: string | undefined) =>
+      Effect.tryPromise({
+        try: () =>
+          auth(oauthProvider, {
+            serverUrl: input.config.url,
+            authorizationCode,
+            iss,
+            scope: oauth?.scope ?? challenge.scope,
+            fetchFn,
+          }),
+        catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+      }).pipe(Effect.flatMap(() => finalize))
+
     yield* Effect.tryPromise({
       try: () => auth(oauthProvider, { serverUrl: input.config.url, scope: oauth?.scope ?? challenge.scope, fetchFn }),
       catch: (error) => (error instanceof Error ? error : new Error(String(error))),
@@ -474,8 +500,21 @@ export const authorize = (input: {
     if (!authorizationUrl)
       return yield* Effect.fail(new Error(`MCP server "${input.name}" did not provide an authorization URL`))
 
+    if (!loopback) {
+      return {
+        url: authorizationUrl.toString(),
+        instructions: `Authorize ${input.name} in your browser, then paste the URL it redirects to or the authorization code.`,
+        mode: "code" as const,
+        callback: (pasted: string) => {
+          const parsed = callbackInput(pasted, state)
+          if (parsed instanceof Error) return Effect.fail(parsed)
+          return exchange(parsed.code, parsed.iss)
+        },
+      }
+    }
+
     const completed = yield* Deferred.make<Credential.OAuth, Error>()
-    yield* Deferred.await(code).pipe(
+    yield* Deferred.await(loopback.code).pipe(
       Effect.flatMap((value) => {
         const respond = (error?: string) =>
           Effect.sync(() =>
@@ -487,18 +526,7 @@ export const authorize = (input: {
                   : OauthCallbackPage.success({ provider: input.name }),
               ),
           )
-        return Effect.tryPromise({
-          try: () =>
-            auth(oauthProvider, {
-              serverUrl: input.config.url,
-              authorizationCode: value.code,
-              iss: value.iss,
-              scope: oauth?.scope ?? challenge.scope,
-              fetchFn,
-            }),
-          catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-        }).pipe(
-          Effect.flatMap(() => finalize),
+        return exchange(value.code, value.iss).pipe(
           Effect.tap(() => respond()),
           Effect.tapError((error) => respond(error.message)),
           Effect.onInterrupt(() => Effect.sync(() => value.response.destroy())),
@@ -530,3 +558,17 @@ export const authorize = (input: {
       }),
     ),
   )
+
+// A pasted redirect URL carries the state to check and may carry iss; a bare code is trusted as-is.
+const callbackInput = (pasted: string, state: string) => {
+  const trimmed = pasted.trim()
+  if (!trimmed) return new Error("Missing authorization code")
+  if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) return { code: trimmed, iss: undefined }
+  const url = new URL(trimmed)
+  const error = url.searchParams.get("error_description") ?? url.searchParams.get("error")
+  if (error) return new Error(error)
+  if (url.searchParams.get("state") !== state) return new Error("OAuth state mismatch")
+  const code = url.searchParams.get("code")
+  if (!code) return new Error("Missing authorization code")
+  return { code, iss: url.searchParams.get("iss") ?? undefined }
+}

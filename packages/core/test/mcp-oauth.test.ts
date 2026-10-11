@@ -104,6 +104,28 @@ const start = (
       integrationID,
       methodID,
     })
+    if (authorization.mode !== "auto") throw new Error("Expected a loopback authorization")
+    return { authorization, url: new URL(authorization.url) }
+  }).pipe(Effect.provideService(Credential.Service, store.service))
+
+const startManual = (
+  target: string | ReturnType<typeof Bun.serve>,
+  oauth?: ConfigMCP.OAuth,
+  store: ReturnType<typeof memoryCredentials> = memoryCredentials([]),
+) =>
+  Effect.gen(function* () {
+    const authorization = yield* McpOAuth.authorize({
+      name: "test",
+      config: new ConfigMCP.Remote({
+        type: "remote",
+        url: typeof target === "string" ? target : target.url.href,
+        ...(oauth ? { oauth } : {}),
+      }),
+      integrationID,
+      methodID,
+      manual: true,
+    })
+    if (authorization.mode !== "code") throw new Error("Expected a manual authorization")
     return { authorization, url: new URL(authorization.url) }
   }).pipe(Effect.provideService(Credential.Service, store.service))
 
@@ -490,6 +512,170 @@ describe("MCP OAuth", () => {
       ),
     ).finally(() => server.stop(true))
     expect(result.access).toBe("access")
+  })
+
+  describe("manual authorization", () => {
+    const tokenServer = (
+      respond: (request: URLSearchParams) => Response = () =>
+        Response.json({ access_token: "access", token_type: "Bearer", refresh_token: "refresh", expires_in: 3600 }),
+    ) => {
+      const tokenRequests: URLSearchParams[] = []
+      const server = Bun.serve({
+        port: 0,
+        async fetch(request) {
+          const url = new URL(request.url)
+          if (request.method !== "POST" || url.pathname !== "/token") return new Response(null, { status: 404 })
+          const body = new URLSearchParams(await request.text())
+          tokenRequests.push(body)
+          return respond(body)
+        },
+      })
+      return { server, tokenRequests }
+    }
+
+    const redirectTo = (url: URL, params: Record<string, string>) => {
+      const redirect = new URL(url.searchParams.get("redirect_uri") ?? "")
+      for (const [key, value] of Object.entries(params)) redirect.searchParams.set(key, value)
+      return redirect.toString()
+    }
+
+    test("completes authorization from a pasted callback URL", async () => {
+      const { server, tokenRequests } = tokenServer()
+
+      const credential = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const { authorization, url } = yield* startManual(server, { client_id: "client" })
+            expect(authorization.instructions).toContain("paste")
+            // Nothing to call back to: the redirect stays on the default loopback address with no listener.
+            expect(url.searchParams.get("redirect_uri")).toBe("http://127.0.0.1/callback")
+            return yield* authorization.callback(
+              redirectTo(url, { code: "accepted", state: url.searchParams.get("state") ?? "" }),
+            )
+          }),
+        ),
+      ).finally(() => server.stop(true))
+
+      expect(credential.access).toBe("access")
+      expect(credential.refresh).toBe("refresh")
+      expect(tokenRequests).toHaveLength(1)
+      expect(tokenRequests[0]?.get("grant_type")).toBe("authorization_code")
+      expect(tokenRequests[0]?.get("code")).toBe("accepted")
+      expect(tokenRequests[0]?.get("code_verifier")).not.toBeNull()
+      expect(tokenRequests[0]?.get("resource")).toBe(server.url.href)
+    })
+
+    test("accepts a bare authorization code", async () => {
+      const { server, tokenRequests } = tokenServer()
+
+      const credential = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const { authorization } = yield* startManual(server, { client_id: "client" })
+            return yield* authorization.callback("accepted")
+          }),
+        ),
+      ).finally(() => server.stop(true))
+
+      expect(credential.access).toBe("access")
+      expect(tokenRequests[0]?.get("code")).toBe("accepted")
+    })
+
+    test("rejects a pasted URL with a mismatched state before any token request", async () => {
+      const { server, tokenRequests } = tokenServer()
+
+      const exit = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const { authorization, url } = yield* startManual(server, { client_id: "client" })
+            return yield* Effect.exit(authorization.callback(redirectTo(url, { code: "accepted", state: "wrong" })))
+          }),
+        ),
+      ).finally(() => server.stop(true))
+
+      expect(Exit.isFailure(exit) && String(Cause.squash(exit.cause))).toContain("OAuth state mismatch")
+      expect(tokenRequests).toHaveLength(0)
+    })
+
+    test("fails with the error carried by a pasted URL", async () => {
+      const { server, tokenRequests } = tokenServer()
+
+      const exit = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const { authorization, url } = yield* startManual(server, { client_id: "client" })
+            return yield* Effect.exit(
+              authorization.callback(
+                redirectTo(url, { error: "access_denied", state: url.searchParams.get("state") ?? "" }),
+              ),
+            )
+          }),
+        ),
+      ).finally(() => server.stop(true))
+
+      expect(Exit.isFailure(exit) && String(Cause.squash(exit.cause))).toContain("access_denied")
+      expect(tokenRequests).toHaveLength(0)
+    })
+
+    test("rejects a pasted URL without a code", async () => {
+      const { server } = tokenServer()
+
+      const exit = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const { authorization, url } = yield* startManual(server, { client_id: "client" })
+            return yield* Effect.exit(
+              authorization.callback(redirectTo(url, { state: url.searchParams.get("state") ?? "" })),
+            )
+          }),
+        ),
+      ).finally(() => server.stop(true))
+
+      expect(Exit.isFailure(exit) && String(Cause.squash(exit.cause))).toContain("Missing authorization code")
+    })
+
+    test("reports a rejected token exchange for an expired or reused code", async () => {
+      const { server } = tokenServer(() =>
+        Response.json({ error: "invalid_grant", error_description: "code expired" }, { status: 400 }),
+      )
+
+      const exit = await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const { authorization, url } = yield* startManual(server, { client_id: "client" })
+            return yield* Effect.exit(
+              authorization.callback(
+                redirectTo(url, { code: "stale", state: url.searchParams.get("state") ?? "" }),
+              ),
+            )
+          }),
+        ),
+      ).finally(() => server.stop(true))
+
+      expect(Exit.isFailure(exit)).toBe(true)
+    })
+
+    test("binds no loopback listener even with a configured callback port", async () => {
+      const { server } = tokenServer()
+      const reservation = Bun.serve({ port: 0, fetch: () => new Response() })
+      const port = reservation.port
+      reservation.stop(true)
+
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* startManual(server, { client_id: "client", callback_port: port })
+            const reached = yield* Effect.promise(() =>
+              fetch(`http://127.0.0.1:${port}/callback`).then(
+                () => true,
+                () => false,
+              ),
+            )
+            expect(reached).toBe(false)
+          }),
+        ),
+      ).finally(() => server.stop(true))
+    })
   })
 
   describe("client registration", () => {

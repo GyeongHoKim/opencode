@@ -15,10 +15,12 @@ const location = { directory: process.cwd() }
 
 export default Runtime.handler(
   Commands.commands.mcp.commands.auth,
-  Effect.fn("cli.mcp.auth")((input) => authenticate(Option.getOrUndefined(input.name)).pipe(handlePromptErrors)),
+  Effect.fn("cli.mcp.auth")((input) =>
+    authenticate(Option.getOrUndefined(input.name), input.manual).pipe(handlePromptErrors),
+  ),
 )
 
-const authenticate = Effect.fn("cli.mcp.auth.run")(function* (name?: string) {
+const authenticate = Effect.fn("cli.mcp.auth.run")(function* (name?: string, manual?: boolean) {
   if (!name) yield* requireInteractive("Pass an MCP server name when running without an interactive terminal")
   intro("Authenticate an MCP server")
   const { endpoint } = yield* ServerConnection.resolve()
@@ -65,7 +67,8 @@ const authenticate = Effect.fn("cli.mcp.auth.run")(function* (name?: string) {
   // keeps the active one's label, and the old ones are only removed once it is stored, so a failed
   // attempt keeps them.
   const previous = integration.connections.filter((connection) => connection.type === "credential")
-  yield* oauthLogin(client, integration, method, yield* answerForm(method.form), previous[0]?.label)
+  const answer = { ...(yield* answerForm(method.form)), ...(manual ? { manual: true } : {}) }
+  yield* oauthLogin(client, integration, method, answer, previous[0]?.label)
   yield* Effect.forEach(
     previous,
     (connection) => request((signal) => client.credential.remove({ credentialID: connection.id }, { signal })),

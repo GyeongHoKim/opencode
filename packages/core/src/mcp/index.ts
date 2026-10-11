@@ -202,12 +202,17 @@ export const layer = (options?: Options) =>
             editor.method.update({
               integrationID,
               method: { id: methodID, type: "oauth", label: name },
-              authorize: () =>
+              authorize: (answer) =>
                 Effect.gen(function* () {
                   const { McpOAuth } = yield* Effect.promise(() => import("./oauth.js"))
-                  return yield* McpOAuth.authorize({ name, config: remote, integrationID, methodID }).pipe(
-                    Effect.provideService(Credential.Service, credentials),
-                  )
+                  // The method declares no form, so `manual` arrives only from a CLI that injects it.
+                  return yield* McpOAuth.authorize({
+                    name,
+                    config: remote,
+                    integrationID,
+                    methodID,
+                    manual: answer["manual"] === true,
+                  }).pipe(Effect.provideService(Credential.Service, credentials))
                 }),
             })
           })
