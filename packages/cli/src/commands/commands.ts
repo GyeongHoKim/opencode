@@ -250,7 +250,7 @@ const Root = Spec.make(typeof OPENCODE_CLI_NAME === "string" ? OPENCODE_CLI_NAME
           description: "Authenticate with an OAuth-capable remote MCP server",
           params: {
             name: Argument.String("name").pipe(Argument.withDescription("Name of the MCP server"), Argument.optional),
-            manual: Flag.Boolean("manual").pipe(
+            noBrowser: Flag.Boolean("no-browser").pipe(
               Flag.withDescription(
                 "Print the authorization URL and paste the redirect URL back instead of listening on localhost",
               ),

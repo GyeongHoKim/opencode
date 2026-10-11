@@ -108,7 +108,7 @@ const start = (
     return { authorization, url: new URL(authorization.url) }
   }).pipe(Effect.provideService(Credential.Service, store.service))
 
-const startManual = (
+const startNoBrowser = (
   target: string | ReturnType<typeof Bun.serve>,
   oauth?: ConfigMCP.OAuth,
   store: ReturnType<typeof memoryCredentials> = memoryCredentials([]),
@@ -123,9 +123,9 @@ const startManual = (
       }),
       integrationID,
       methodID,
-      manual: true,
+      noBrowser: true,
     })
-    if (authorization.mode !== "code") throw new Error("Expected a manual authorization")
+    if (authorization.mode !== "code") throw new Error("Expected a no-browser authorization")
     return { authorization, url: new URL(authorization.url) }
   }).pipe(Effect.provideService(Credential.Service, store.service))
 
@@ -514,7 +514,7 @@ describe("MCP OAuth", () => {
     expect(result.access).toBe("access")
   })
 
-  describe("manual authorization", () => {
+  describe("no-browser authorization", () => {
     const tokenServer = (
       respond: (request: URLSearchParams) => Response = () =>
         Response.json({ access_token: "access", token_type: "Bearer", refresh_token: "refresh", expires_in: 3600 }),
@@ -545,7 +545,7 @@ describe("MCP OAuth", () => {
       const credential = await Effect.runPromise(
         Effect.scoped(
           Effect.gen(function* () {
-            const { authorization, url } = yield* startManual(server, { client_id: "client" })
+            const { authorization, url } = yield* startNoBrowser(server, { client_id: "client" })
             expect(authorization.instructions).toContain("paste")
             // Nothing to call back to: the redirect stays on the default loopback address with no listener.
             expect(url.searchParams.get("redirect_uri")).toBe("http://127.0.0.1/callback")
@@ -571,7 +571,7 @@ describe("MCP OAuth", () => {
       const credential = await Effect.runPromise(
         Effect.scoped(
           Effect.gen(function* () {
-            const { authorization } = yield* startManual(server, { client_id: "client" })
+            const { authorization } = yield* startNoBrowser(server, { client_id: "client" })
             return yield* authorization.callback("accepted")
           }),
         ),
@@ -587,7 +587,7 @@ describe("MCP OAuth", () => {
       const exit = await Effect.runPromise(
         Effect.scoped(
           Effect.gen(function* () {
-            const { authorization, url } = yield* startManual(server, { client_id: "client" })
+            const { authorization, url } = yield* startNoBrowser(server, { client_id: "client" })
             return yield* Effect.exit(authorization.callback(redirectTo(url, { code: "accepted", state: "wrong" })))
           }),
         ),
@@ -603,7 +603,7 @@ describe("MCP OAuth", () => {
       const exit = await Effect.runPromise(
         Effect.scoped(
           Effect.gen(function* () {
-            const { authorization, url } = yield* startManual(server, { client_id: "client" })
+            const { authorization, url } = yield* startNoBrowser(server, { client_id: "client" })
             return yield* Effect.exit(
               authorization.callback(
                 redirectTo(url, { error: "access_denied", state: url.searchParams.get("state") ?? "" }),
@@ -623,7 +623,7 @@ describe("MCP OAuth", () => {
       const exit = await Effect.runPromise(
         Effect.scoped(
           Effect.gen(function* () {
-            const { authorization, url } = yield* startManual(server, { client_id: "client" })
+            const { authorization, url } = yield* startNoBrowser(server, { client_id: "client" })
             return yield* Effect.exit(
               authorization.callback(redirectTo(url, { state: url.searchParams.get("state") ?? "" })),
             )
@@ -642,7 +642,7 @@ describe("MCP OAuth", () => {
       const exit = await Effect.runPromise(
         Effect.scoped(
           Effect.gen(function* () {
-            const { authorization, url } = yield* startManual(server, { client_id: "client" })
+            const { authorization, url } = yield* startNoBrowser(server, { client_id: "client" })
             return yield* Effect.exit(
               authorization.callback(
                 redirectTo(url, { code: "stale", state: url.searchParams.get("state") ?? "" }),
@@ -664,7 +664,7 @@ describe("MCP OAuth", () => {
       await Effect.runPromise(
         Effect.scoped(
           Effect.gen(function* () {
-            yield* startManual(server, { client_id: "client", callback_port: port })
+            yield* startNoBrowser(server, { client_id: "client", callback_port: port })
             const reached = yield* Effect.promise(() =>
               fetch(`http://127.0.0.1:${port}/callback`).then(
                 () => true,

@@ -333,7 +333,7 @@ export const authorize = (input: {
   readonly integrationID: Integration.ID
   readonly methodID: Integration.MethodID
   /** Paste-the-callback flow for hosts the browser cannot call back to; skips the loopback listener. */
-  readonly manual?: boolean
+  readonly noBrowser?: boolean
 }) =>
   Effect.gen(function* () {
     const fields = { server: input.name, methodID: input.methodID, oauthAttemptID: crypto.randomUUID() }
@@ -355,8 +355,8 @@ export const authorize = (input: {
     const redirectPath = redirect?.pathname ?? "/callback"
     const state = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url")
 
-    // Manual mode serves hosts the browser cannot call back to, so it binds no listener.
-    const loopback = input.manual
+    // No-browser mode serves hosts the browser cannot call back to, so it binds no listener.
+    const loopback = input.noBrowser
       ? undefined
       : yield* Effect.gen(function* () {
           const code = yield* Deferred.make<

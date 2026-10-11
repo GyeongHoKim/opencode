@@ -52,7 +52,7 @@ test("mcp auth accepts an optional server name and rejects no-name noninteractiv
   const help = cli(["--help"])
   const usage = await new Response(help.stdout).text()
   expect(usage).toContain("opencode mcp auth [flags] [<name>]")
-  expect(usage).toContain("--manual")
+  expect(usage).toContain("--no-browser")
   expect(await help.exited).toBe(0)
 
   const missing = cli([])

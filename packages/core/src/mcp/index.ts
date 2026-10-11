@@ -205,13 +205,13 @@ export const layer = (options?: Options) =>
               authorize: (answer) =>
                 Effect.gen(function* () {
                   const { McpOAuth } = yield* Effect.promise(() => import("./oauth.js"))
-                  // The method declares no form, so `manual` arrives only from a CLI that injects it.
+                  // The method declares no form, so `noBrowser` arrives only from a CLI that injects it.
                   return yield* McpOAuth.authorize({
                     name,
                     config: remote,
                     integrationID,
                     methodID,
-                    manual: answer["manual"] === true,
+                    noBrowser: answer["noBrowser"] === true,
                   }).pipe(Effect.provideService(Credential.Service, credentials))
                 }),
             })
